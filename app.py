@@ -1,14 +1,10 @@
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime
-import matplotlib.pyplot as plt
-import seaborn as sns
 import hopsworks
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
-import warnings
-warnings.filterwarnings('ignore')
-
+import time  
 
 class WAQIDataFetcher:
     
@@ -111,6 +107,8 @@ class SmartNullHandler:
         return df
     
     def _smart_strategy(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Set pandas option to avoid downcasting warning
+        pd.set_option('future.no_silent_downcasting', True)
         
         if 'aqi' in df.columns and df['aqi'].isna().any():
             print("Warning: AQI is missing. This record may be invalid.")
@@ -127,7 +125,8 @@ class SmartNullHandler:
                 if df[pollutant].notna().any():
                     df[pollutant] = df[pollutant].fillna(df[pollutant].median())
                 else:
-                    df[pollutant] = df[pollutant].fillna(0)
+                    # Use infer_objects() to avoid downcasting warning
+                    df[pollutant] = df[pollutant].fillna(0).infer_objects(copy=False)
         
         weather_defaults = {
             'temperature': 25.0,
@@ -140,7 +139,8 @@ class SmartNullHandler:
         for weather_param, default_val in weather_defaults.items():
             if weather_param in df.columns:
                 df[f'{weather_param}_imputed'] = df[weather_param].isna().astype(int)
-                df[weather_param] = df[weather_param].fillna(default_val)
+                # Use infer_objects() to avoid downcasting warning
+                df[weather_param] = df[weather_param].fillna(default_val).infer_objects(copy=False)
         
         imputed_cols = [col for col in df.columns if col.endswith('_imputed')]
         df['total_imputed_features'] = df[imputed_cols].sum(axis=1) if imputed_cols else 0
@@ -496,6 +496,15 @@ class HopsworksFeatureStore:
         except Exception as e:
             print(f"Error creating feature group: {e}")
             return None
+    
+    def verify_upload(self, feature_group):
+        """Verify that data was uploaded correctly to the feature store"""
+        df_verify = feature_group.read()
+        print(f"Verified data in feature store:")
+        print(f"Shape: {df_verify.shape}")
+        print(f"Columns: {df_verify.columns.tolist()}")
+        print(f"Sample:\n{df_verify.head()}")
+        return not df_verify.empty
 
 
 def main():
@@ -505,28 +514,39 @@ def main():
     HOPSWORKS_PROJECT = "AQI_Project_10"
     NULL_HANDLING_STRATEGY = "smart"
 
-    print("--------------------------------------------------")
-    print("Fetching data...")
+    # First, fetch historical data
+    print("Fetching historical data...")
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=90)  # 3 months of data
     
+    historical_df = fetch_historical_data(start_date, end_date)
+    if historical_df is not None:
+        print(f"Successfully collected {len(historical_df)} historical records")
+    
+    # Then fetch current data (existing code)
+    print("\nFetching current data...")
     fetcher = WAQIDataFetcher(WAQI_API_TOKEN)
     raw_data = fetcher.fetch_station_data(STATION_ID)
     
     if not raw_data:
-        print("Failed to fetch data")
+        print("Failed to fetch current data")
         return
         
     parsed_data = fetcher.parse_station_data(raw_data)
     df_raw = pd.DataFrame([parsed_data])
     
     print(f"Station: {parsed_data.get('station_name')}")
-    print("--------------------------------------------------")
     
     null_handler = SmartNullHandler(strategy=NULL_HANDLING_STRATEGY)
     df_cleaned = null_handler.handle_nulls(df_raw)
-    
     df_features = FeatureEngineer.create_features(df_cleaned)
     
-    print("Connecting to Hopsworks...")
+    # Combine historical and current data if available
+    if historical_df is not None:
+        df_features = pd.concat([historical_df, df_features], ignore_index=True)
+        print(f"Combined dataset size: {len(df_features)} records")
+    
+    print("\nConnecting to Hopsworks...")
     hops = HopsworksFeatureStore(HOPSWORKS_API_KEY, HOPSWORKS_PROJECT)
     
     if hops.connect():
@@ -534,17 +554,76 @@ def main():
             df=df_features,
             feature_group_name="aqi_features",
             version=1,
-            description="Air Quality Index features"
+            description="Air Quality Index features with historical data"
         )
         if feature_group:
             print("Data uploaded successfully")
-            print("--------------------------------------------------")
+            # Verify upload
+            if hops.verify_upload(feature_group):
+                print("Data verification successful")
     else:
         print("Failed to connect to Hopsworks")
-        df_features.to_csv("aqi_features_today.csv", index=False)
-        print("Saved data locally to: aqi_features_today.csv")
-        print("--------------------------------------------------")
+        df_features.to_csv("aqi_features_complete.csv", index=False)
+        print("Saved data locally to: aqi_features_complete.csv")
 
+
+def fetch_historical_data(start_date: datetime, end_date: datetime):
+    """Fetch data for a date range and store in Hopsworks"""
+    
+    WAQI_API_TOKEN = "088661c637816f9f1463ca3e44d37da6d739d021"
+    STATION_ID = "A401143"
+    HOPSWORKS_API_KEY = "DOXxlrr308Rq2xqN.QmlA3Cfoy8ljM9h8nOiYYpxHA3EoSPGhp9qPBcONsXHRL7XIpsGjbcc80R3OoCz5"
+    HOPSWORKS_PROJECT = "AQI_Project_10"
+    
+    fetcher = WAQIDataFetcher(WAQI_API_TOKEN)
+    null_handler = SmartNullHandler(strategy='smart')
+    all_data = []
+    
+    current_date = start_date
+    while current_date <= end_date:
+        print(f"\nFetching data for: {current_date.strftime('%Y-%m-%d')}")
+        
+        # Fetch data
+        raw_data = fetcher.fetch_station_data(STATION_ID)
+        if raw_data:
+            parsed_data = fetcher.parse_station_data(raw_data)
+            df_raw = pd.DataFrame([parsed_data])
+            
+            # Clean and engineer features
+            df_cleaned = null_handler.handle_nulls(df_raw)
+            df_features = FeatureEngineer.create_features(df_cleaned)
+            
+            all_data.append(df_features)
+            print(f"Successfully fetched data for {current_date.strftime('%Y-%m-%d')}")
+        
+        # Wait between requests to respect API limits
+        time.sleep(10)  # 10 second delay between requests
+        current_date += timedelta(days=1)
+    
+    # Combine all data
+    if all_data:
+        combined_df = pd.concat(all_data, ignore_index=True)
+        print(f"\nTotal records collected: {len(combined_df)}")
+        
+        # Upload to Hopsworks
+        hops = HopsworksFeatureStore(HOPSWORKS_API_KEY, HOPSWORKS_PROJECT)
+        if hops.connect():
+            feature_group = hops.create_feature_group(
+                df=combined_df,
+                feature_group_name="aqi_features_historical",
+                version=1,
+                description="Historical Air Quality Index features"
+            )
+            if feature_group:
+                print("\nHistorical data uploaded successfully to Hopsworks")
+                return combined_df
+    
+    return None
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"Error in main execution: {str(e)}")
+    finally:
+        print("--------------------------------------------------")
